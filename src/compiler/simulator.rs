@@ -66322,6 +66322,51 @@ impl Simulator {
                 return v.range_select((lsb + w - 1) as usize, lsb as usize);
             }
         }
+        // LRM §25.8: `<recv>.<vifprop>.<member>` VALUE read where `<recv>` is
+        // not a plain hierarchical name — a class handle held in a subroutine
+        // LOCAL, an instance property, or a nested chain. The name-based
+        // rewrites above only fire for receivers the parser kept as a single
+        // hierarchical identifier (module-scope dotted names); anything rooted
+        // at a local class handle parses as MemberAccess, fell through to the
+        // generic property read, and returned the binding-EXISTENCE sentinel
+        // instead of the interface. Consequence: a driver that received its
+        // `vif` through config_db/resource_db read x from every `vif.<sig>`
+        // access, so its handshake never completed and the testbench ran
+        // silently empty. Resolve the owning handle generally, then follow the
+        // binding recorded by the write path.
+        {
+            let mut vif_pair: Option<(usize, String)> = None;
+            // Split WITHOUT evaluating: the receiver evaluation is only worth
+            // doing when the trailing member is a known vif property name.
+            if let Some((obj_expr, prop)) = Self::split_trailing_member(expr) {
+                let prop_is_vif = self.class_member_names().vif_props.contains(&prop);
+                if prop_is_vif {
+                    if let Some(h) = self.eval_expr(&obj_expr).to_u64() {
+                        vif_pair = Some((h as usize, prop));
+                    }
+                }
+            }
+            if let Some((recv_h, prop)) = vif_pair {
+                let is_vif = recv_h != 0
+                    && self
+                        .heap
+                        .get(recv_h)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| self.module.classes.get(&i.class_name))
+                        .map(|c| c.virtual_iface_properties.contains_key(&prop))
+                        .unwrap_or(false);
+                if is_vif {
+                    if let Some((bound, _mp)) =
+                        self.virtual_iface_bindings.get(&(recv_h, prop)).cloned()
+                    {
+                        let resolved = format!("{}.{}", bound, member.name);
+                        if let Some(v) = self.lookup_signal_value(&resolved) {
+                            return v;
+                        }
+                    }
+                }
+            }
+        }
         let base = self.eval_expr(expr);
         let handle = base.to_u64().unwrap_or(0) as usize;
         // §8.9: a STATIC property is shared and instance-independent —
@@ -107151,6 +107196,24 @@ impl Simulator {
                         let a = arg.trim();
                         let resolved = carried.get(a).cloned().unwrap_or_else(|| a.to_string());
                         next.insert(pname.clone(), resolved);
+                    } else if let Some((_, frag)) =
+                        pcd.type_param_defaults.iter().find(|(n, _)| n == pname)
+                    {
+                        // IEEE 1800-2023 §6.20.2: an extends clause that omits a
+                        // parameter leaves it at its DECLARED DEFAULT. Without
+                        // this the parameter's bare NAME leaked into the
+                        // specialization signature (`pbase#(T)`), and resolving
+                        // `T` in that spec failed — a type parameter read as
+                        // `logic`. That is the `class d extends pbase;` shape
+                        // (`class base_test extends base_test_param;`), where the
+                        // derived class silently lost every defaulted parameter.
+                        next.insert(pname.clone(), frag.trim().to_string());
+                    } else if let Some((_, Some(init))) =
+                        pcd.param_defaults.iter().find(|(n, _)| n == pname)
+                    {
+                        if let Some(frag) = self.expr_to_spec_fragment(init) {
+                            next.insert(pname.clone(), frag);
+                        }
                     }
                 }
                 carried = next;
@@ -107172,11 +107235,33 @@ impl Simulator {
         } else {
             cd.param_order.clone()
         };
-        order
-            .iter()
-            .map(|p| carried.get(p).cloned().unwrap_or_else(|| p.clone()))
-            .collect::<Vec<_>>()
-            .join(",")
+        let mut out: Vec<String> = Vec::with_capacity(order.len());
+        for p in order.iter() {
+            if let Some(v) = carried.get(p) {
+                out.push(v.clone());
+                continue;
+            }
+            // A parameter the extends chain never supplied is using its
+            // DECLARED DEFAULT (§6.20.2) — use the default fragment, not the
+            // parameter's own bare name. The bare name produced a spec key
+            // like `pbase#(T)` that no resolution could bind, so a type
+            // parameter in the method body fell back to `logic`.
+            if let Some((_, frag)) = cd.type_param_defaults.iter().find(|(n, _)| n == p) {
+                let frag = frag.trim();
+                if !frag.is_empty() {
+                    out.push(frag.to_string());
+                    continue;
+                }
+            }
+            if let Some((_, Some(init))) = cd.param_defaults.iter().find(|(n, _)| n == p) {
+                if let Some(frag) = self.expr_to_spec_fragment(init) {
+                    out.push(frag);
+                    continue;
+                }
+            }
+            out.push(p.clone());
+        }
+        out.join(",")
     }
 
     /// §8.25 generic spec derivation for a member accessed from subclass
@@ -108079,9 +108164,15 @@ impl Simulator {
                     // usual shape in a constructor that takes the interface as
                     // an argument.
                     ExprKind::This => self.this_stack.last().copied().flatten().unwrap_or(0),
-                    // Nested receiver (`p.cfg.vif = bus` in MemberAccess
-                    // form) — resolve the owner chain to its handle.
-                    _ => self.eval_handle_expr(expr).unwrap_or(0),
+                    // Nested receiver (`p.cfg.vif = bus` in MemberAccess form,
+                    // or a vif reached through an object held in an instance
+                    // property) — evaluate the owner chain to its handle.
+                    // `eval_handle_expr` alone missed the property-chain shape
+                    // and left the handle 0, dropping the binding.
+                    _ => match Self::split_trailing_member(expr) {
+                        Some((owner, _)) => self.eval_expr(&owner).to_u64().unwrap_or(0) as usize,
+                        None => self.eval_handle_expr(expr).unwrap_or(0),
+                    },
                 };
                 (obj_handle, member.name.clone())
             }
@@ -118557,6 +118648,29 @@ impl Simulator {
                                 self.current_spec = Some((cn, sig_frags.join(",")));
                             }
                         }
+                    }
+                }
+            }
+        }
+        // §8.25 (generic receiver specialization). The synchronous method path
+        // (`exec_method_in_class_hierarchy`) seeds `current_spec` from the
+        // CONCRETE receiver's extends chain when the method is DECLARED in a
+        // PARAMETERIZED ancestor. The task path had only the instance's own
+        // bindings, which for a non-parameterized leaf carry nothing — so a
+        // virtual TASK inherited from a parameterized base (`class d extends
+        // pbase;` with an inherited `task body()` that uses `T`, e.g.
+        // `T::type_id::create`) resolved `T` to the unknown-type fallback,
+        // `logic`, and every create returned null: the run reported UVM_ERROR 0
+        // while driving no transactions at all. Mirror the function path here.
+        if let Some(h) = handle_opt {
+            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
+                let leaf = inst.class_name.clone();
+                if !self.class_is_parameterized(&leaf)
+                    && self.class_is_parameterized(&mclass)
+                    && self.class_extends(&leaf, &mclass)
+                {
+                    if let Some(spec) = self.static_receiver_spec(&leaf, &mclass) {
+                        self.current_spec = Some(spec);
                     }
                 }
             }
